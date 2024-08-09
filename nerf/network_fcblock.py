@@ -227,8 +227,9 @@ class HyPNeRF(nn.Module):
         pred_shape = self.clip_fc_shape(clip_embedding)
         pred_color = self.clip_fc_color(clip_embedding)
 
-        z_shape = self.shape_code(idx)
-        z_color = self.color_code(idx)
+        with torch.no_grad():
+            z_shape = self.shape_code(idx)
+            z_color = self.color_code(idx)
         
         return {
             'pred_shape': pred_shape,
@@ -244,22 +245,23 @@ class HyPNeRF(nn.Module):
             pred_shape, pred_color = clip_output['pred_shape'], clip_output['pred_color']
             gt_shape, gt_color = clip_output['shape_code'], clip_output['color_code']
 
-            with torch.no_grad():
+            if test_finally:
                 # using the predicted mappings to generate the data
                 pred_params = self.hyper_net(pred_shape, pred_color) 
 
-                pred_rendered_output = self.net.render(rays_o, rays_d, staged=staged, bg_color=bg_color, perturb=perturb, force_all_rays=force_all_rays,params=pred_params,idx=idx, **kwargs)
-
-                # using the hn mappings to generate the hn gt data
-                gt_params = self.hyper_net(gt_shape, gt_color) 
-
-                gt_rendered_output = self.net.render(rays_o, rays_d, staged=staged, bg_color=bg_color, perturb=perturb, force_all_rays=force_all_rays,params=gt_params,idx=idx, **kwargs)
+                rendered_output = self.net.render(rays_o, rays_d, staged=staged, bg_color=bg_color, perturb=perturb, force_all_rays=force_all_rays,params=pred_params,idx=idx, **kwargs)
             
-            return [pred_rendered_output, gt_rendered_output, clip_output] 
+            else:
+                # using the hn mappings to generate the hn gt data
+                gt_params = self.get_params(idx, input_dict)
+
+                rendered_output = self.net.render(rays_o, rays_d, staged=staged, bg_color=bg_color, perturb=perturb, force_all_rays=force_all_rays,params=gt_params,idx=idx, **kwargs)
+            
+            return [rendered_output, clip_output] 
         else:
             outputs = self.get_params(idx, input_dict)
 
             nerf = self.net.render(rays_o, rays_d, staged=staged, bg_color=bg_color, perturb=perturb, force_all_rays=force_all_rays, params=outputs, idx=idx, **kwargs)
             
-            return nerf
+            return [nerf]
 

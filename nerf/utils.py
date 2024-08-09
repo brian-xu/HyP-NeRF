@@ -474,8 +474,17 @@ class Trainer(object):
             gt_rgb = images
 
         outputs = self.model(index, data, rays_o, rays_d, staged=False, bg_color=bg_color, perturb=True, force_all_rays=False if self.opt.patch_size == 1 else True, **vars(self.opt))
-
-        pred_rgb = outputs['image']
+        losses = [None]
+        
+        pred_rgb = outputs[0]['image']
+            
+        # clip opt
+        if len(outputs) == 2:
+            clip_criterion = nn.MSELoss()
+            shape_loss = clip_criterion(outputs[1]['pred_shape'], outputs[1]['shape_code'])
+            color_loss = clip_criterion(outputs[1]['pred_color'], outputs[1]['color_code'])
+            losses.append(shape_loss)
+            losses.append(color_loss)
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]
@@ -493,8 +502,9 @@ class Trainer(object):
             loss = loss.mean(0)
 
         loss = loss.mean()
+        losses[0] = loss
                     
-        return pred_rgb, gt_rgb, loss
+        return pred_rgb, gt_rgb, losses
 
     def eval_step(self, _data):
 
@@ -523,9 +533,9 @@ class Trainer(object):
         
         outputs = self.model(index, data,rays_o, rays_d, staged=True, bg_color=bg_color, perturb=False, **vars(self.opt))
         
-        pred_rgb = outputs['image'].reshape(B, H, W, 3)
-        pred_depth = outputs['depth'].reshape(B, H, W)
-        pred_mask = outputs['weights_sum'].reshape(B, H, W)
+        pred_rgb = outputs[0]['image'].reshape(B, H, W, 3)
+        pred_depth = outputs[0]['depth'].reshape(B, H, W)
+        pred_mask = outputs[0]['weights_sum'].reshape(B, H, W)
 
         loss = self.criterion(pred_rgb, gt_rgb).mean()
 
@@ -553,8 +563,8 @@ class Trainer(object):
 
         outputs = self.model(index,data,rays_o, rays_d, staged=True, bg_color=bg_color, perturb=perturb,test_finally=True, **vars(self.opt))
         
-        pred_rgb = outputs['image'].reshape(-1, H, W, 3)
-        pred_depth = outputs['depth'].reshape(-1, H, W)
+        pred_rgb = outputs[0]['image'].reshape(-1, H, W, 3)
+        pred_depth = outputs[0]['depth'].reshape(-1, H, W)
 
         return pred_rgb, pred_depth
 
@@ -698,9 +708,10 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             with torch.cuda.amp.autocast(enabled=self.fp16):
-                preds, truths, loss = self.train_step(data)
-         
-            self.scaler.scale(loss).backward()
+                preds, truths, losses = self.train_step(data)
+            
+            for loss in losses:
+                self.scaler.scale(loss).backward()
 
             nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
             self.scaler.step(self.optimizer)

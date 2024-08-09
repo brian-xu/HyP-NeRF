@@ -1,0 +1,5 @@
+ftfy
+regex
+tqdm
+CLIP @ git+https://github.com/openai/CLIP.git
+imageio-ffmpeg

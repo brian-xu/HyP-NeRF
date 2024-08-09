@@ -1,16 +1,55 @@
 import torch
 import argparse
+import json, time
 
-from nerf.provider_abo import MetaNeRFDataset
+from nerf.provider_abo import MetaNeRFDataset, nerf_matrix_to_ngp
 from nerf.network_fcblock import NeRFNetwork,HyPNeRF
 from nerf.utils import *
 
+torch.set_grad_enabled(False)
 
 #torch.autograd.set_detect_anomaly(True)
 
 '''
 TODO - sanity check after modifying the val code
 '''
+
+def get_random_rays(opt,poses,intrinsics,H,W,index=None):
+        if index is None:
+            index = [0]
+        B = len(index) # a list of length 1
+
+        rays = get_rays(poses[index], intrinsics, H, W, -1, patch_size=opt.patch_size)
+        results = {
+            'H': H,
+            'W': W,
+            'rays_o': rays['rays_o'],
+            'rays_d': rays['rays_d'],
+            'patch_size': opt.patch_size,
+        }
+               
+        results['poses'] = poses
+        results['intrinsics'] = intrinsics
+
+        results['num_rays'] = opt.num_rays
+
+        return results
+
+def load_checkpoint(hyp_model, opt, checkpoint=None, model_only=False):
+        ckpt_path = os.path.join(opt.workspace, 'checkpoints_saved')
+        if checkpoint is None:
+            checkpoint_list = sorted(glob.glob(f'{ckpt_path}/ngp_ep*.pth'))
+            if checkpoint_list:
+                checkpoint = checkpoint_list[-1]
+                
+        print(f'Loading checkpoint path from inside utils : {checkpoint}')
+        checkpoint_dict = torch.load(checkpoint, map_location=opt.device)
+        
+        if 'model' not in checkpoint_dict:
+            hyp_model.load_state_dict(checkpoint_dict)
+            return
+
+        missing_keys, unexpected_keys = hyp_model.load_state_dict(checkpoint_dict['model'], strict=False)
 
 if __name__ == '__main__':
 
@@ -68,7 +107,7 @@ if __name__ == '__main__':
         assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
 
 
-    checkpoints_path = os.path.join(opt.workspace, "checkpoints")
+    checkpoints_path = os.path.join(opt.workspace, "checkpoints_saved")
     if not opt.load_ckpt and os.path.exists(checkpoints_path):
         import shutil
         shutil.rmtree(checkpoints_path)
@@ -83,46 +122,67 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     opt.device = device
     
-    # for compression, train set = val set = test set
-    if not opt.test:
-        train_dataset = MetaNeRFDataset(opt, device=device, type='train',class_choice=opt.class_choice)
-        val_dataset = MetaNeRFDataset(opt, device=device, type='val',class_choice=opt.class_choice)
-        
-        train_loader = DataLoader(train_dataset, batch_size=opt.b, shuffle=True, num_workers=4)
-        valid_loader = DataLoader(val_dataset, batch_size=opt.b, shuffle=True, num_workers=4)
+    num_examples = 1152 # copied from training set
     
-    # test
-    else:
-        test_dataset = MetaNeRFDataset(opt, device=device, type='test',class_choice=opt.class_choice)
-
-        test_loader = DataLoader(test_dataset, batch_size=opt.b, shuffle=False, num_workers=4)
-    
-    num_examples = train_dataset.num_examples() if not opt.test else test_dataset.num_examples()
-
-    model = HyPNeRF(opt, num_examples) 
+    model = HyPNeRF(opt, num_examples).to(device)
         
     print(model)
+        
+    model.net.aabb_train = torch.FloatTensor([-0.5, -0.5, -0.5, 0.5, 0.5, 0.5]).cuda()
+    model.net.aabb_infer = torch.FloatTensor([-0.5, -0.5, -0.5, 0.5, 0.5, 0.5]).cuda()
+    load_checkpoint(model, opt)
     
-    print(f"Number of training examples: {num_examples}")
-    optimizer = lambda model: torch.optim.Adam(model.parameters(), betas=(0.9, 0.99), eps=1e-15)
+    model.eval()
     
-    # decay to 0.1 * init_lr at last iter step
-    scheduler = lambda optimizer: optim.lr_scheduler.LambdaLR(optimizer, lambda iter: 0.1 ** min(iter / opt.iters, 1))
-
-    # metrics = [PSNRMeter()]
-    metrics = [PSNRMeter(), LPIPSMeter(device=device)]
-    trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, optimizer=optimizer,
-        criterion=criterion, ema_decay=0.95, fp16=opt.fp16, lr_scheduler=scheduler,
-        scheduler_update_every_step=True, metrics=metrics, use_checkpoint=opt.ckpt, eval_interval=opt.eval_interval, max_keep_ckpt=opt.max_keep_ckpt)
-
-    if not opt.test:
-        trainer.train(train_loader, valid_loader, 2000)
+    pred_shape = model.shape_code(torch.LongTensor([0]).cuda())
+    pred_color = model.color_code(torch.LongTensor([0]).cuda())
     
+    with open("/home/brian/Downloads/abo_dataset/ABO_rendered/B00BBDF500/metadata.json", 'r') as f:
+        transform = json.load(f)
+    H = W = 512
+    images = None
+    poses = []
+    
+    frames = transform["views"]
+    pose = np.array(frames[0]['pose'], dtype=np.float32).reshape(4,4) # [4, 4]
+    pose = nerf_matrix_to_ngp(pose, scale=opt.scale, offset=opt.offset)
+    poses.append(pose)
+    
+    poses = torch.from_numpy(np.stack(poses, axis=0)).cuda() # [N, 4, 4]
+    
+    # load intrinsics
+    if 'fl_x' in transform or 'fl_y' in transform:
+        fl_x = (transform['fl_x'] if 'fl_x' in transform else transform['fl_y']) / opt.downscale
+        fl_y = (transform['fl_y'] if 'fl_y' in transform else transform['fl_x']) / opt.downscale
+    elif 'camera_angle_x' in transform or 'camera_angle_y' in transform:
+        # blender, assert in radians. already downscaled since we use H/W
+        fl_x = W / (2 * np.tan(transform['camera_angle_x'] / 2)) if 'camera_angle_x' in transform else None
+        fl_y = H / (2 * np.tan(transform['camera_angle_y'] / 2)) if 'camera_angle_y' in transform else None
+        if fl_x is None: fl_x = fl_y
+        if fl_y is None: fl_y = fl_x
     else:
-        # for rendering the NeRF with poses other than train poses, crop the NeRF to remove floaters
-        model.net.aabb_train = torch.FloatTensor([-0.5, -0.5, -0.5, 0.5, 0.5, 0.5]).cuda()
-        model.net.aabb_infer = torch.FloatTensor([-0.5, -0.5, -0.5, 0.5, 0.5, 0.5]).cuda()
-        trainer.test(test_loader, write_video=True, conditional_index=opt.test_index) # test and save video
-        # trainer.evaluate(test_loader)
+        fl_x = fl_y = 443.40496826171875 # focal length for ABO dataset
+
+    cx = (transform['cx'] / opt.downscale) if 'cx' in transform else (W / 2)
+    cy = (transform['cy'] / opt.downscale) if 'cy' in transform else (H / 2)
+
+    intrinsics = np.array([fl_x, fl_y, cx, cy])
+    results = get_random_rays(opt, poses, intrinsics, H, W)
     
-    # trainer.save_mesh(resolution=1024, threshold=10,index=20)
+    rays_o = results['rays_o'].to(device).squeeze(1)
+    rays_d = results['rays_d'].to(device).squeeze(1)
+    
+    pred_params = model.hyper_net(pred_shape, pred_color)
+    outputs = model.net.render(rays_o, rays_d, staged=True, bg_color=None, perturb=True, force_all_rays=False,params=pred_params,idx=None, **vars(opt))
+    
+    preds = outputs['image'].reshape(-1, H, W, 3)
+    preds_depth = outputs['depth'].reshape(-1, H, W)
+
+    pred = preds[0].detach().cpu().numpy()
+    pred = (pred * 255).astype(np.uint8)
+    
+    pred_depth = preds_depth[0].detach().cpu().numpy()
+    pred_depth = (pred_depth * 255).astype(np.uint8)
+    
+    cv2.imwrite(os.path.join(opt.workspace, f'ngp_{int(time.time())}_rgb.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(os.path.join(opt.workspace, f'ngp_{int(time.time())}_depth.png'), pred_depth)

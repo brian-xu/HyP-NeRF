@@ -227,4 +227,5 @@ class MetaNeRFDataset(Dataset):
         results = self.get_random_rays(images, poses, intrinsics, H, W)
 
         results["filename"] = f"{object_id}_{self.index.item()}"
+        # results = data used in training
         return results, index
