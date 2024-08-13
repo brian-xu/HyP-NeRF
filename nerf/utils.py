@@ -477,14 +477,12 @@ class Trainer(object):
         losses = [None]
         
         pred_rgb = outputs[0]['image']
-            
+        
         # clip opt
         if len(outputs) == 2:
-            clip_criterion = nn.MSELoss()
-            shape_loss = clip_criterion(outputs[1]['pred_shape'], outputs[1]['shape_code'])
-            color_loss = clip_criterion(outputs[1]['pred_color'], outputs[1]['color_code'])
-            losses.append(shape_loss)
-            losses.append(color_loss)
+            pred_embedding = torch.stack((outputs[1]['pred_shape'], outputs[1]['pred_color']))
+            gt_embedding = torch.stack((outputs[1]['shape_code'], outputs[1]['color_code']))
+            losses.append(self.criterion(pred_embedding, gt_embedding).mean())
 
         # MSE loss
         loss = self.criterion(pred_rgb, gt_rgb).mean(-1) # [B, N, 3] --> [B, N]

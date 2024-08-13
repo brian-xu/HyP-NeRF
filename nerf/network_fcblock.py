@@ -150,7 +150,7 @@ class HyPNeRF(nn.Module):
     '''
 
     def __init__(self, opt, num_instances=1, mode='nerf', type='relu',
-                 hn_hidden_features=512, hn_hidden_layers=1, hn_in=512, std=0.01, **kwargs):
+                 hn_hidden_features=512, hn_hidden_layers=1, hn_in=512, std=1.0, **kwargs):
         super().__init__()
 
         self.mode = mode

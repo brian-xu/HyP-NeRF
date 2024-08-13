@@ -164,10 +164,11 @@ if __name__ == '__main__':
     
     model.eval()
     
-    retrieval_index = 0
+    clip_text = "an office chair"
+    clip_embedding = model.clip_encoder.prepare_text([clip_text]).float()
     
-    pred_shape = model.shape_code(torch.LongTensor([retrieval_index]).cuda())
-    pred_color = model.color_code(torch.LongTensor([retrieval_index]).cuda())
+    pred_shape = model.clip_fc_shape(clip_embedding)
+    pred_color = model.clip_fc_color(clip_embedding)
     pred_params = model.hyper_net(pred_shape, pred_color)
     
     results = get_video_rays()
