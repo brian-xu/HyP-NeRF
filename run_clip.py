@@ -35,7 +35,7 @@ def get_random_rays(opt,poses,intrinsics,H,W,index=None):
 
         return results
 
-def get_video_rays():
+def get_video_rays(poses):
     with open(f"{opt.path}/ABO_rendered/B00BBDF500/metadata.json", 'r') as f:
         transform = json.load(f)
     H = W = 512
@@ -61,18 +61,15 @@ def get_video_rays():
 
     intrinsics = np.array([fl_x, fl_y, cx, cy])
     
-    for frame in frames:
-        pose = np.array(frame['pose'], dtype=np.float32).reshape(4,4) # [4, 4]
-        pose = nerf_matrix_to_ngp(pose, scale=opt.scale, offset=opt.offset)
-        
-        poses = torch.from_numpy(np.stack([pose], axis=0)).cuda() # [N, 4, 4]
-        
-        result = get_random_rays(opt, poses, intrinsics, H, W)
+    for pose in poses:
+        pose = torch.squeeze(pose)
+        pose = torch.stack([pose])
+        result = get_random_rays(opt, pose, intrinsics, H, W)
         results.append(result)
     return results
 
 def load_checkpoint(hyp_model, opt, checkpoint=None, model_only=False):
-        ckpt_path = os.path.join(opt.workspace, 'checkpoints_saved')
+        ckpt_path = os.path.join(opt.workspace, 'checkpoints')
         if checkpoint is None:
             checkpoint_list = sorted(glob.glob(f'{ckpt_path}/ngp_ep*.pth'))
             if checkpoint_list:
@@ -119,7 +116,7 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training") # Placeholder, not used for HyP-NeRF
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP") # Placeholder, not used for HyP-NeRF
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend") # Placeholder, not used for HyP-NeRF
-    parser.add_argument('--clip_mapping', action='store_true', help="learn a mapping from clip space to the hypernetwork space")
+    parser.add_argument('--clip_mapping', type=bool, default=True, help="learn a mapping from clip space to the hypernetwork space")
 
 
     ### dataset options
@@ -143,7 +140,7 @@ if __name__ == '__main__':
         assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
 
 
-    checkpoints_path = os.path.join(opt.workspace, "checkpoints_saved")
+    checkpoints_path = os.path.join(opt.workspace, "checkpoints")
 
     print(f"Options: {opt}")
     
@@ -164,14 +161,26 @@ if __name__ == '__main__':
     
     model.eval()
     
-    clip_text = "an office chair"
-    clip_embedding = model.clip_encoder.prepare_text([clip_text]).float()
+    # clip_text = "a purple armchair"
+    # clip_embedding = model.clip_encoder.prepare_text([clip_text]).float()
     
+    image = cv2.imread(f"{opt.workspace}/chair.jpg", cv2.IMREAD_UNCHANGED)
+    if image.shape[-1] == 3: 
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    else:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
+    image = image.astype(np.float32) / 255.0 # [H, W, 3/4]
+    image = torch.from_numpy(np.stack([image], axis=0)).permute(0,-1,1,2).cuda()
+    clip_embedding = model.clip_encoder.prepare_image(image).float()
+
     pred_shape = model.clip_fc_shape(clip_embedding)
     pred_color = model.clip_fc_color(clip_embedding)
     pred_params = model.hyper_net(pred_shape, pred_color)
     
-    results = get_video_rays()
+    with open(f"{opt.workspace}/poses.pkl", 'rb') as f:
+        import pickle
+        poses = pickle.load(f)
+        results = get_video_rays(poses)
     all_preds = []
     all_preds_depth = []
     

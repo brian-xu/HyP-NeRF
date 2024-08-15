@@ -621,7 +621,7 @@ class Trainer(object):
         self.evaluate_one_epoch(loader, name)
         self.use_tensorboardX = use_tensorboardX
 
-    def test(self, loader, conditional_index=None, save_path=None, name=None, write_video=True):
+    def test(self, loader, conditional_index=None, save_path=None, name=None, write_video=True, save_poses=False):
 
         if save_path is None:
             save_path = os.path.join(self.results_save_path, 'results')
@@ -639,6 +639,8 @@ class Trainer(object):
         if write_video:
             all_preds = []
             all_preds_depth = []
+            if save_poses:
+                poses = []
 
         with torch.no_grad():
 
@@ -658,6 +660,8 @@ class Trainer(object):
                 if write_video:
                     all_preds.append(pred)
                     all_preds_depth.append(pred_depth)
+                    if save_poses:
+                        poses.append(data[0]["poses"])
                 else:
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_rgb.png'), cv2.cvtColor(pred, cv2.COLOR_RGB2BGR))
                     cv2.imwrite(os.path.join(save_path, f'{name}_{i:04d}_depth.png'), pred_depth)
@@ -669,6 +673,10 @@ class Trainer(object):
             all_preds_depth = np.stack(all_preds_depth, axis=0)
             imageio.mimwrite(os.path.join(save_path, f'{name}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
             imageio.mimwrite(os.path.join(save_path, f'{name}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
+            if save_poses:
+                import pickle
+                with open(os.path.join(save_path, f'poses.pkl'), 'wb') as f:
+                    pickle.dump(poses, f)
         
         self.log(f"==> Finished Test.")
         

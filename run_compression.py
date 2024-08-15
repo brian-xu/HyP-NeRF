@@ -35,7 +35,7 @@ def get_random_rays(opt,poses,intrinsics,H,W,index=None):
 
         return results
 
-def get_video_rays():
+def get_video_rays(poses):
     with open(f"{opt.path}/ABO_rendered/B00BBDF500/metadata.json", 'r') as f:
         transform = json.load(f)
     H = W = 512
@@ -61,18 +61,15 @@ def get_video_rays():
 
     intrinsics = np.array([fl_x, fl_y, cx, cy])
     
-    for frame in frames:
-        pose = np.array(frame['pose'], dtype=np.float32).reshape(4,4) # [4, 4]
-        pose = nerf_matrix_to_ngp(pose, scale=opt.scale, offset=opt.offset)
-        
-        poses = torch.from_numpy(np.stack([pose], axis=0)).cuda() # [N, 4, 4]
-        
-        result = get_random_rays(opt, poses, intrinsics, H, W)
+    for pose in poses:
+        pose = torch.squeeze(pose)
+        pose = torch.stack([pose])
+        result = get_random_rays(opt, pose, intrinsics, H, W)
         results.append(result)
     return results
 
 def load_checkpoint(hyp_model, opt, checkpoint=None, model_only=False):
-        ckpt_path = os.path.join(opt.workspace, 'checkpoints_saved')
+        ckpt_path = os.path.join(opt.workspace, 'checkpoints')
         if checkpoint is None:
             checkpoint_list = sorted(glob.glob(f'{ckpt_path}/ngp_ep*.pth'))
             if checkpoint_list:
@@ -143,7 +140,7 @@ if __name__ == '__main__':
         assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
 
 
-    checkpoints_path = os.path.join(opt.workspace, "checkpoints_saved")
+    checkpoints_path = os.path.join(opt.workspace, "checkpoints")
 
     print(f"Options: {opt}")
     
@@ -170,7 +167,10 @@ if __name__ == '__main__':
     pred_color = model.color_code(torch.LongTensor([retrieval_index]).cuda())
     pred_params = model.hyper_net(pred_shape, pred_color)
     
-    results = get_video_rays()
+    with open(f"{opt.workspace}/poses.pkl", 'rb') as f:
+        import pickle
+        poses = pickle.load(f)
+        results = get_video_rays(poses)
     all_preds = []
     all_preds_depth = []
     
