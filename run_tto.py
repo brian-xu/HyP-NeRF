@@ -1,12 +1,11 @@
 import torch
 import argparse
-import json, time, tqdm
+import json, time, tqdm, gc
+from torch import nn
 
-from nerf.provider_abo import MetaNeRFDataset
+from nerf.provider_abo import MetaNeRFDataset, nerf_matrix_to_ngp
 from nerf.network_fcblock import NeRFNetwork,HyPNeRF
 from nerf.utils import *
-
-torch.set_grad_enabled(False)
 
 #torch.autograd.set_detect_anomaly(True)
 
@@ -35,18 +34,18 @@ def get_random_rays(opt,poses,intrinsics,H,W,index=None):
 
         return results
 
-def get_video_rays(poses):
+def get_video_rays(poses, downscale = 1):
     with open(f"{opt.path}/ABO_rendered/B00BBDF500/metadata.json", 'r') as f:
         transform = json.load(f)
-    H = W = 512
+    H = W = 512 // downscale
     
     frames = transform["views"]
     results = []
     
     # load intrinsics
     if 'fl_x' in transform or 'fl_y' in transform:
-        fl_x = (transform['fl_x'] if 'fl_x' in transform else transform['fl_y']) / opt.downscale
-        fl_y = (transform['fl_y'] if 'fl_y' in transform else transform['fl_x']) / opt.downscale
+        fl_x = (transform['fl_x'] if 'fl_x' in transform else transform['fl_y']) / downscale
+        fl_y = (transform['fl_y'] if 'fl_y' in transform else transform['fl_x']) / downscale
     elif 'camera_angle_x' in transform or 'camera_angle_y' in transform:
         # blender, assert in radians. already downscaled since we use H/W
         fl_x = W / (2 * np.tan(transform['camera_angle_x'] / 2)) if 'camera_angle_x' in transform else None
@@ -54,10 +53,10 @@ def get_video_rays(poses):
         if fl_x is None: fl_x = fl_y
         if fl_y is None: fl_y = fl_x
     else:
-        fl_x = fl_y = 443.40496826171875 # focal length for ABO dataset
+        fl_x = fl_y = 443.40496826171875 / downscale # focal length for ABO dataset
 
-    cx = (transform['cx'] / opt.downscale) if 'cx' in transform else (W / 2)
-    cy = (transform['cy'] / opt.downscale) if 'cy' in transform else (H / 2)
+    cx = (transform['cx'] / downscale) if 'cx' in transform else (W / 2)
+    cy = (transform['cy'] / downscale) if 'cy' in transform else (H / 2)
 
     intrinsics = np.array([fl_x, fl_y, cx, cy])
     
@@ -67,6 +66,15 @@ def get_video_rays(poses):
         result = get_random_rays(opt, pose, intrinsics, H, W)
         results.append(result)
     return results
+
+def get_fixed_pose(opt, idx):
+    with open(f"{opt.workspace}/tto/metadata.json", 'r') as f:
+        transform = json.load(f)
+        frames = transform["views"]
+        pose = np.array(frames[idx]['pose'], dtype=np.float32).reshape(4,4)
+        pose = nerf_matrix_to_ngp(pose, scale=opt.scale, offset=opt.offset)
+        poses = torch.from_numpy(np.stack([pose], axis=0))
+    return poses
 
 def load_checkpoint(hyp_model, opt, checkpoint=None, model_only=False):
         ckpt_path = os.path.join(opt.workspace, 'checkpoints')
@@ -116,7 +124,7 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true', help="use amp mixed precision training") # Placeholder, not used for HyP-NeRF
     parser.add_argument('--ff', action='store_true', help="use fully-fused MLP") # Placeholder, not used for HyP-NeRF
     parser.add_argument('--tcnn', action='store_true', help="use TCNN backend") # Placeholder, not used for HyP-NeRF
-    parser.add_argument('--clip_mapping', type=bool, default=True, help="learn a mapping from clip space to the hypernetwork space")
+    parser.add_argument('--clip_mapping', action='store_true', help="learn a mapping from clip space to the hypernetwork space")
 
 
     ### dataset options
@@ -160,22 +168,54 @@ if __name__ == '__main__':
     load_checkpoint(model, opt)
     
     model.eval()
+
+    class TTO(nn.Module):
+        def __init__(self, hyp_model,opt):
+            super(TTO, self).__init__()
+            self.hyp_model = hyp_model
+            self.opt = opt
+            self.pred_shape = torch.nn.Parameter(hyp_model.shape_code(torch.LongTensor([0]).cuda()).detach(), requires_grad=True)
+            self.pred_color = torch.nn.Parameter(hyp_model.color_code(torch.LongTensor([0]).cuda()).detach(), requires_grad=True)
+        
+        def forward(self, x):
+            pred_params = self.hyp_model.hyper_net(self.pred_shape, self.pred_color)
+            result = get_video_rays(x, 2)[0]
+            
+            H, W = result['H'], result['W']
+            
+            rays_o = result['rays_o'].to(device).squeeze(1)
+            rays_d = result['rays_d'].to(device).squeeze(1)
+            
+            outputs = self.hyp_model.net.render(rays_o, rays_d, staged=True, bg_color=None, perturb=False, force_all_rays=False,params=pred_params,idx=None,  **vars(self.opt))
+            
+            preds = outputs['image'].reshape(-1, H, W, 3)
+            pred = (preds[0] * 255)
+            return pred
+
+    tto_model = TTO(model, opt)
+    tto_iters = 1000
+    optimizer = torch.optim.Adam(tto_model.parameters(), betas=(0.9, 0.99), eps=1e-6)
+    mse = torch.nn.MSELoss()
     
-    # clip_text = "a purple armchair"
-    # clip_embedding = model.clip_encoder.prepare_text([clip_text]).float()
-    
-    image = cv2.imread(f"{opt.workspace}/chair.jpg", cv2.IMREAD_UNCHANGED)
+    poses = get_fixed_pose(opt, 11)
+    image = cv2.imread(f"{opt.workspace}/tto/chair.jpg", cv2.IMREAD_UNCHANGED)
     if image.shape[-1] == 3: 
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     else:
         image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA)
-    image = image.astype(np.float32) / 255.0 # [H, W, 3/4]
-    image = torch.from_numpy(np.stack([image], axis=0)).permute(0,-1,1,2).cuda()
-    clip_embedding = model.clip_encoder.prepare_image(image).float()
-
-    pred_shape = model.clip_fc_shape(clip_embedding)
-    pred_color = model.clip_fc_color(clip_embedding)
-    pred_params = model.hyper_net(pred_shape, pred_color)
+    image = cv2.resize(image, (256, 256))
+    gt = torch.FloatTensor(image.astype(np.float32)).cuda()
+    
+        
+    for step in tqdm.tqdm(range(tto_iters)):
+        pred = tto_model(poses)
+        loss = mse(pred, gt)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        
+    torch.set_grad_enabled(False)
+    pred_params = model.hyper_net(tto_model.pred_shape, tto_model.pred_color)
     
     with open(f"{opt.workspace}/poses.pkl", 'rb') as f:
         import pickle
@@ -207,4 +247,5 @@ if __name__ == '__main__':
     all_preds_depth = np.stack(all_preds_depth, axis=0)
     imageio.mimwrite(os.path.join(opt.workspace, f'ngp_{int(time.time())}_rgb.mp4'), all_preds, fps=25, quality=8, macro_block_size=1)
     imageio.mimwrite(os.path.join(opt.workspace, f'ngp_{int(time.time())}_depth.mp4'), all_preds_depth, fps=25, quality=8, macro_block_size=1)
+    
         

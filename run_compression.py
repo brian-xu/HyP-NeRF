@@ -2,7 +2,7 @@ import torch
 import argparse
 import json, time, tqdm
 
-from nerf.provider_abo import MetaNeRFDataset, nerf_matrix_to_ngp
+from nerf.provider_abo import MetaNeRFDataset
 from nerf.network_fcblock import NeRFNetwork,HyPNeRF
 from nerf.utils import *
 
